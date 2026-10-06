@@ -18,12 +18,14 @@ from dockq.mapping import (
     build_ab_ag_pairs,
     format_dockq_mappings,
 )
+from dockq.ranking import filter_models_by_ranking
 from dockq.run import run_dockq, run_dockq_with_mappings
 from dockq.analyze import (
     parse_dockq_output,
     filter_ab_ag_interfaces,
     determine_quality_bin,
     aggregate_interface_metrics,
+    is_ab_ag_interface,
 )
 
 
@@ -31,29 +33,56 @@ from dockq.analyze import (
 FASTA_DIR = Path("/home/mullagaliamova/ClaudeWorkspace/PROJECTS/cdr-h3-folding/data/fasta-filtered")
 CIFS_FILTERED_DIR = Path("/home/mullagaliamova/ClaudeWorkspace/PROJECTS/cdr-h3-folding/data/CIFs-filtered-new")
 CIFS_DIR = Path("/home/mullagaliamova/ClaudeWorkspace/PROJECTS/cdr-h3-folding/data/CIFs")
-ANARCI_REPORT_PATH = Path("/home/mullagaliamova/ClaudeWorkspace/PROJECTS/cdr-h3-folding/results/reports/anarci_crop_report.tsv")
+ANARCI_REPORT_PATH = Path("/mnt/1857e392-c689-44a8-9c3e-e7f9beab82f6/results/reports/anarci_report.tsv")
 
 
-def find_model_files(s3data_dir: Path) -> list[dict[str, Path]]:
-    """Find all model files in s3data directory."""
+def find_model_files(s3data_dir: Path, pdb_id: str = None) -> list[dict[str, Path]]:
+    """
+    Find all model files in s3data directory.
+
+    For multiseed layouts (<pdb>/seed-<seed>_sample-<k>/), only the seed
+    models are returned; the top-level <pdb>_model.cif (the pipeline's
+    overall best) is skipped. For single-model layouts (no seed dirs),
+    the top-level model is returned.
+
+    Args:
+        s3data_dir: Directory containing AlphaFold predictions
+        pdb_id: If set, only process this PDB ID
+    """
     models = []
 
     if not s3data_dir.exists():
         print(f"WARNING: s3data directory not found: {s3data_dir}")
         return models
 
-    for pdb_dir in s3data_dir.iterdir():
-        if not pdb_dir.is_dir():
-            continue
+    pdb_dirs = [d for d in s3data_dir.iterdir() if d.is_dir()]
+    if pdb_id is not None:
+        pdb_dirs = [d for d in pdb_dirs if d.name == pdb_id]
 
-        pdb_id = pdb_dir.name
+    for pdb_dir in pdb_dirs:
+        current_pdb = pdb_dir.name
 
-        for model_file in pdb_dir.rglob("*_model.cif"):
-            models.append({
-                'pdb_id': pdb_id,
-                'model_path': model_file,
-                'ref_id': pdb_id
-            })
+        # Find seed subdirectories
+        seed_dirs = [d for d in pdb_dir.iterdir() if d.is_dir() and d.name.startswith('seed-')]
+
+        if seed_dirs:
+            # Multiseed: one model per seed-<seed>_sample-<k> directory
+            for seed_dir in sorted(seed_dirs):
+                for model_file in seed_dir.rglob("*_model.cif"):
+                    models.append({
+                        'pdb_id': current_pdb,
+                        'model_path': model_file,
+                        'ref_id': current_pdb,
+                        'seed': seed_dir.name
+                    })
+        else:
+            # No seed subdirectories - single model, find it directly
+            for model_file in pdb_dir.rglob("*_model.cif"):
+                models.append({
+                    'pdb_id': current_pdb,
+                    'model_path': model_file,
+                    'ref_id': current_pdb
+                })
 
     return models
 
@@ -69,21 +98,21 @@ def find_reference(pdb_id: str, cifs_filtered_dir: Path, cifs_dir: Path) -> Opti
     return None
 
 
-def write_interface_report(results: list[dict], output_file: Path):
-    """
-    Write interface report with AB-AG interface metrics only.
-
-    One row per interface, filtered to include only antibody-antigen interfaces.
-    """
+def write_header(output_file: Path):
+    """Write TSV header if file doesn't exist."""
     headers = [
         "pdb_id", "model_name", "reference_path", "interface_id",
         "native_chains", "ab_chains", "ag_chains",
         "dockq_score", "iRMSD", "LRMSD", "fnat", "quality_bin"
     ]
+    if not output_file.exists() or output_file.stat().st_size == 0:
+        with open(output_file, 'w') as f:
+            f.write('\t'.join(headers) + '\n')
 
-    with open(output_file, 'w') as f:
-        f.write('\t'.join(headers) + '\n')
 
+def append_results(results: list[dict], output_file: Path):
+    """Append results to TSV file."""
+    with open(output_file, 'a') as f:
         for r in results:
             row = [
                 r.get("pdb_id", "N/A"),
@@ -101,6 +130,15 @@ def write_interface_report(results: list[dict], output_file: Path):
             ]
             f.write('\t'.join(row) + '\n')
 
+
+def write_interface_report(results: list[dict], output_file: Path):
+    """
+    Write interface report with AB-AG interface metrics only.
+
+    One row per interface, filtered to include only antibody-antigen interfaces.
+    """
+    write_header(output_file)
+    append_results(results, output_file)
     print(f"Interface report saved to: {output_file}")
 
 
@@ -161,8 +199,13 @@ def main():
     parser.add_argument(
         "-o", "--output",
         type=Path,
-        default=Path("dockq_interface_results.tsv"),
-        help="Output TSV file for interface report (default: dockq_interface_results.tsv)"
+        default=Path("dockq_detailed_report.tsv"),
+        help="Output TSV file with all interfaces (default: dockq_detailed_report.tsv)"
+    )
+    parser.add_argument(
+        "--interface-report",
+        type=Path,
+        help="Write AB-AG interfaces only to this file (filtered report)"
     )
     parser.add_argument(
         "--summary",
@@ -173,6 +216,20 @@ def main():
         "--pdb-id",
         type=str,
         help="Process only a specific PDB ID"
+    )
+    parser.add_argument(
+        "--top-per-seed",
+        type=int,
+        default=None,
+        help="Only process the top N models per seed by ranking_score "
+             "(needs <pdb>_ranking_scores.csv next to the seed dirs)"
+    )
+    parser.add_argument(
+        "--top-per-seed",
+        type=int,
+        default=None,
+        help="Only process the top N models per seed by ranking_score "
+             "(needs <pdb>_ranking_scores.csv next to the seed dirs)"
     )
     parser.add_argument(
         "--limit",
@@ -188,17 +245,12 @@ def main():
         "--anarci-report",
         type=Path,
         default=ANARCI_REPORT_PATH,
-        help=f"ANARCI crop report for AB/AG chain mapping (default: {ANARCI_REPORT_PATH})"
+        help=f"ANARCI report for AB/AG chain mapping (default: {ANARCI_REPORT_PATH})"
     )
     parser.add_argument(
         "--no-chain-mapping",
         action="store_true",
         help="Skip AB/AG chain mapping even if ANARCI report is available"
-    )
-    parser.add_argument(
-        "--use-mappings",
-        action="store_true",
-        help="Pass explicit --mapping flags to DockQ for AB-AG pairs only"
     )
     parser.add_argument(
         "--group-by",
@@ -230,23 +282,15 @@ def main():
     print(f"\nLooking for models in: {args.s3data_dir}")
     print(f"Reference CIFs (filtered): {args.cifs_filtered_dir}")
     print(f"Reference CIFs (all): {args.cifs_dir}")
-    print(f"Output file: {args.output}")
+    print(f"Output file (all interfaces): {args.output}")
+    if args.interface_report:
+        print(f"Interface report (AB-AG only): {args.interface_report}")
     if args.summary:
         print(f"Summary report: {args.summary}")
-    if args.use_mappings:
-        print("Using explicit --mapping flags for AB-AG pairs only")
 
     # Find all model files
     if args.pdb_id:
-        models = []
-        pdb_dir = args.s3data_dir / args.pdb_id
-        if pdb_dir.exists():
-            for model_file in pdb_dir.rglob("*_model.cif"):
-                models.append({
-                    'pdb_id': args.pdb_id,
-                    'model_path': model_file,
-                    'ref_id': args.pdb_id
-                })
+        models = find_model_files(args.s3data_dir, pdb_id=args.pdb_id)
         if not models:
             print(f"ERROR: No model files found for PDB ID: {args.pdb_id}")
             sys.exit(1)
@@ -263,14 +307,24 @@ def main():
                     limited_models.append(m)
             models = limited_models
 
+    # Pre-filter to top N models per seed (needs <pdb>_ranking_scores.csv)
+    if args.top_per_seed is not None:
+        models = filter_models_by_ranking(models, args.top_per_seed)
+        print(f"After ranking filter (top {args.top_per_seed}/seed): {len(models)} model(s)")
+
     if not models:
         print("ERROR: No model files found")
         sys.exit(1)
 
     print(f"\nFound {len(models)} model(s)")
 
+    # Initialize output files with headers
+    write_header(args.output)
+    if args.interface_report:
+        write_header(args.interface_report)
+
     # Process each model
-    results = []
+    all_results = []  # Keep for summary report
     success_count = 0
     fail_count = 0
     no_ref_count = 0
@@ -279,6 +333,9 @@ def main():
         pdb_id = model_info['pdb_id']
         model_path = model_info['model_path']
         ref_id = model_info['ref_id']
+
+        # Reset per-model results list
+        results = []
 
         if not model_path.exists():
             print(f"\n[{pdb_id}] Model not found: {model_path}")
@@ -296,18 +353,11 @@ def main():
         print(f"\n[{pdb_id}] Model: {model_path.name}")
         print(f"       Reference: {ref_path.name}")
 
-        # Get chain mapping
+        # Get chain mapping for filtering AB-AG interfaces
         ab_chains, ag_chains = get_chain_type_mapping(ab_ag_mapping, pdb_id)
 
-        if args.use_mappings and ab_chains and ag_chains:
-            # Run DockQ with explicit AB-AG mappings
-            pairs = build_ab_ag_pairs(ab_ag_mapping, pdb_id)
-            mapping_args = format_dockq_mappings(pairs)
-            print(f"       Mappings: {pairs}")
-            dockq_output = run_dockq(model_path, ref_path, mapping_args)
-        else:
-            # Run DockQ without explicit mappings
-            dockq_output = run_dockq(model_path, ref_path)
+        # Run DockQ (no --mapping flags, filter by native_chains post-hoc)
+        dockq_output = run_dockq(model_path, ref_path)
 
         if dockq_output is None:
             print(f"       ERROR: DockQ failed")
@@ -320,14 +370,12 @@ def main():
         print(f"       Global DockQ: {global_dockq}")
         print(f"       Interfaces found: {len(interfaces)}")
 
-        # Filter to AB-AG interfaces only
+        # Create results for each interface (all interfaces, not filtered)
         if ab_chains and ag_chains:
-            filtered = filter_ab_ag_interfaces(interfaces, ab_chains, ag_chains)
-            if len(filtered) < len(interfaces):
-                print(f"       AB-AG interfaces: {len(filtered)} (excluded {len(interfaces) - len(filtered)} non-AB-AG)")
-            interfaces = filtered
+            ab_ag_count = sum(1 for iface in interfaces if is_ab_ag_interface(iface.get("native_chains", ""), ab_chains, ag_chains))
+            if ab_ag_count < len(interfaces):
+                print(f"       AB-AG interfaces: {ab_ag_count} (excluded {len(interfaces) - ab_ag_count} non-AB-AG)")
 
-        # Create results for each interface
         for idx, iface in enumerate(interfaces, 1):
             iface_dockq = iface.get("dockq_score", "N/A")
             quality_bin = determine_quality_bin(iface_dockq)
@@ -335,12 +383,15 @@ def main():
             print(f"       Interface {idx}: {iface.get('native_chains', 'N/A')} "
                   f"DockQ={iface_dockq} ({quality_bin})")
 
-            results.append({
+            native_chains = iface.get("native_chains", "N/A")
+            is_ab_ag = is_ab_ag_interface(native_chains, ab_chains, ag_chains) if ab_chains and ag_chains else True
+
+            result = {
                 "pdb_id": pdb_id,
                 "model_path": model_path,
                 "reference_path": ref_path,
                 "interface_id": f"{pdb_id}_{model_path.stem}_iface{idx}",
-                "native_chains": iface.get("native_chains", "N/A"),
+                "native_chains": native_chains,
                 "ab_chains": ",".join(ab_chains) if ab_chains else "N/A",
                 "ag_chains": ",".join(ag_chains) if ag_chains else "N/A",
                 "dockq_score": iface_dockq,
@@ -348,17 +399,19 @@ def main():
                 "LRMSD": iface.get("LRMSD", "N/A"),
                 "fnat": iface.get("fnat", "N/A"),
                 "quality_bin": quality_bin,
-            })
+                "is_ab_ag": is_ab_ag,
+            }
+            results.append(result)
+            all_results.append(result)
+
+        if dockq_output is not None:
+            # Write results incrementally after each model
+            append_results(results, args.output)
+            if args.interface_report:
+                ab_ag_results = [r for r in results if r.get("is_ab_ag", False)]
+                append_results(ab_ag_results, args.interface_report)
 
         success_count += 1
-
-    # Write interface report
-    write_interface_report(results, args.output)
-
-    # Write summary report if requested
-    if args.summary:
-        aggregated = aggregate_interface_metrics(results, group_by=args.group_by)
-        write_summary_report(aggregated, args.summary, args.group_by)
 
     # Summary
     print(f"\n{'='*60}")
@@ -368,7 +421,7 @@ def main():
     print(f"Successful: {success_count}")
     print(f"No reference: {no_ref_count}")
     print(f"Failed: {fail_count}")
-    print(f"Total interfaces: {len(results)}")
+    print(f"Total interfaces: {len(all_results)}")
 
 
 if __name__ == "__main__":

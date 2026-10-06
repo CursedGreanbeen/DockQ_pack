@@ -8,13 +8,13 @@ from typing import Optional
 
 def load_anarci_report(report_path: Path) -> dict[str, dict[str, str]]:
     """
-    Load ANARCI crop report and return chain type mapping by PDB ID.
+    Load ANARCI report and return chain type mapping by PDB ID.
 
     Returns:
         {pdb_id: {chain: 'AB' or 'AG'}}
 
     Status meanings:
-        - CROPPED -> Antibody chain (AB)
+        - ANTIBODY -> Antibody chain (AB)
         - NOT_RECOGNIZED -> Antigen chain (AG)
     """
     mappings: dict[str, dict[str, str]] = defaultdict(dict)
@@ -25,21 +25,22 @@ def load_anarci_report(report_path: Path) -> dict[str, dict[str, str]]:
     with open(report_path, 'r') as f:
         reader = csv.DictReader(f, delimiter='\t')
         for row in reader:
-            file_name = row['file']
+            pdb_id = row['pdb_id']
             chain = row['chain']
             status = row['status']
 
-            # Skip special status rows
-            if status in ('NO_ANTIBODY_CHAINS',):
+            # Skip special status rows (but NOT NO_ANTIBODY_DOMAIN - that's antigen)
+            if status == 'NO_ANTIBODY_CHAINS':
                 continue
 
-            # Extract PDB ID from filename (e.g., "11hk.fasta" -> "11hk")
-            pdb_id = file_name.replace('.fasta', '').replace('_1', '').replace('_2', '')
+            # Strip _model suffix if present (from model ANARCI reports)
+            if pdb_id.endswith('_model'):
+                pdb_id = pdb_id[:-6]
 
             # Classify chains
-            if status == 'CROPPED':
+            if status == 'ANTIBODY':
                 mappings[pdb_id][chain] = 'AB'  # Antibody chain
-            elif status == 'NOT_RECOGNIZED':
+            elif status in ('NOT_RECOGNIZED', 'NO_ANTIBODY_DOMAIN'):
                 mappings[pdb_id][chain] = 'AG'  # Antigen chain
 
     return dict(mappings)
