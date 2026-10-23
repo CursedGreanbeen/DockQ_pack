@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Optional
 
 
-DOCKQ_PATH = "/home/mullagaliamova/miniconda3/envs/dockq_env/bin/DockQ"
+DOCKQ_PATH = "/data/user/mullagaliamova/.conda/envs/dockq_env/bin/DockQ"
 
 
 def run_dockq(
@@ -49,25 +49,16 @@ def run_dockq_with_mappings(
     ag_chains: list[str]
 ) -> Optional[str]:
     """
-    Run DockQ with explicit AB-AG chain pair mappings.
-
-    Creates --mapping flags for each AB-AG pair to ensure only
-    antibody-antigen interfaces are evaluated.
+    Run DockQ without mappings. Filtering happens post-hoc based on native_chains.
 
     Args:
         model_path: Path to predicted structure
         reference_path: Path to reference structure
-        ab_chains: List of antibody chain IDs
-        ag_chains: List of antigen chain IDs
+        ab_chains: List of antibody chain IDs (unused, kept for API compatibility)
+        ag_chains: List of antigen chain IDs (unused, kept for API compatibility)
 
     Returns:
         DockQ output as string, or None if failed
     """
-    # Build mappings for each AB-AG pair
-    mappings = []
-    for ab in ab_chains:
-        for ag in ag_chains:
-            pair = ab + ag
-            mappings.extend(['--mapping', f'{pair}:{pair}'])
-
-    return run_dockq(model_path, reference_path, mappings)
+    # Run without --mapping, filter interfaces later
+    return run_dockq(model_path, reference_path, None)

@@ -107,6 +107,26 @@ def filter_ab_ag_interfaces(
     return filtered
 
 
+def is_ab_ag_interface(
+    native_chains: str,
+    ab_chains: list[str],
+    ag_chains: list[str]
+) -> bool:
+    """
+    Check if an interface is an AB-AG interface.
+
+    Returns True if the interface contains at least one AB chain AND at least one AG chain.
+    """
+    ab_set = set(ab_chains)
+    ag_set = set(ag_chains)
+    chains = set(c.strip() for c in native_chains.replace(',', ' ').split())
+
+    has_ab = bool(chains & ab_set)
+    has_ag = bool(chains & ag_set)
+
+    return has_ab and has_ag
+
+
 def determine_quality_bin(dockq_score: str) -> str:
     """Determine quality bin from DockQ score."""
     if dockq_score == "N/A":

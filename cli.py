@@ -8,6 +8,7 @@ import argparse
 import sys
 from pathlib import Path
 from typing import Optional
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 # Add parent directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -174,6 +175,67 @@ def write_summary_report(aggregated: list[dict], output_file: Path, group_by: st
     print(f"Summary report saved to: {output_file}")
 
 
+def process_model(model_info, cifs_filtered_dir, cifs_dir, ab_ag_mapping, log_dir=None):
+    """Run DockQ for one model and return its list of interface result dicts."""
+    pdb_id = model_info['pdb_id']
+    model_path = model_info['model_path']
+    ref_id = model_info['ref_id']
+
+    results = []
+    log_f = None
+    if log_dir:
+        log_f = open(log_dir / f"{pdb_id}.log", 'a')
+
+    def log(msg):
+        if log_f:
+            log_f.write(msg + '\n')
+            log_f.flush()
+
+    if not model_path.exists():
+        log(f"[{pdb_id}] Model not found: {model_path}")
+        if log_f: log_f.close()
+        return {"status": "fail", "pdb_id": pdb_id, "results": []}
+
+    ref_path = find_reference(ref_id, cifs_filtered_dir, cifs_dir)
+    if not ref_path:
+        log(f"[{pdb_id}] No reference found for {pdb_id}")
+        if log_f: log_f.close()
+        return {"status": "no_ref", "pdb_id": pdb_id, "results": []}
+
+    ab_chains, ag_chains = get_chain_type_mapping(ab_ag_mapping, pdb_id)
+    dockq_output = run_dockq(model_path, ref_path)
+
+    if dockq_output is None:
+        log(f"[{pdb_id}] ERROR: DockQ failed")
+        if log_f: log_f.close()
+        return {"status": "fail", "pdb_id": pdb_id, "results": []}
+
+    global_result, interfaces = parse_dockq_output(dockq_output)
+
+    for idx, iface in enumerate(interfaces, 1):
+        native_chains = iface.get("native_chains", "N/A")
+        is_ab_ag = is_ab_ag_interface(native_chains, ab_chains, ag_chains) if ab_chains and ag_chains else True
+        results.append({
+            "pdb_id": pdb_id,
+            "model_path": model_path,
+            "reference_path": ref_path,
+            "interface_id": f"{pdb_id}_{model_path.stem}_iface{idx}",
+            "native_chains": native_chains,
+            "ab_chains": ",".join(ab_chains) if ab_chains else "N/A",
+            "ag_chains": ",".join(ag_chains) if ag_chains else "N/A",
+            "dockq_score": iface.get("dockq_score", "N/A"),
+            "iRMSD": iface.get("iRMSD", "N/A"),
+            "LRMSD": iface.get("LRMSD", "N/A"),
+            "fnat": iface.get("fnat", "N/A"),
+            "quality_bin": determine_quality_bin(iface.get("dockq_score", "N/A")),
+            "is_ab_ag": is_ab_ag,
+        })
+
+    if log_f:
+        log_f.close()
+    return {"status": "success", "pdb_id": pdb_id, "results": results}
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Batch DockQ assessment for antibody-antigen complexes"
@@ -225,13 +287,6 @@ def main():
              "(needs <pdb>_ranking_scores.csv next to the seed dirs)"
     )
     parser.add_argument(
-        "--top-per-seed",
-        type=int,
-        default=None,
-        help="Only process the top N models per seed by ranking_score "
-             "(needs <pdb>_ranking_scores.csv next to the seed dirs)"
-    )
-    parser.add_argument(
         "--limit",
         type=int,
         help="Process only the first N PDB directories"
@@ -258,6 +313,12 @@ def main():
         choices=["pdb_id", "ab_chains", "ab_ag_pair"],
         default="pdb_id",
         help="Grouping key for summary report (default: pdb_id)"
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=4,
+        help="Number of parallel worker processes for DockQ runs (default: 4; set up to 250 on cluster)"
     )
 
     args = parser.parse_args()
@@ -329,89 +390,29 @@ def main():
     fail_count = 0
     no_ref_count = 0
 
-    for model_info in sorted(models, key=lambda x: (x['pdb_id'], str(x['model_path']))):
-        pdb_id = model_info['pdb_id']
-        model_path = model_info['model_path']
-        ref_id = model_info['ref_id']
+    with ProcessPoolExecutor(max_workers=args.workers) as executor:
+        futures = {
+            executor.submit(process_model, model_info, args.cifs_filtered_dir, args.cifs_dir, ab_ag_mapping, args.log_dir): model_info
+            for model_info in models
+        }
 
-        # Reset per-model results list
-        results = []
+        for future in as_completed(futures):
+            outcome = future.result()
 
-        if not model_path.exists():
-            print(f"\n[{pdb_id}] Model not found: {model_path}")
-            fail_count += 1
-            continue
+            if outcome["status"] == "fail":
+                fail_count += 1
+                continue
+            if outcome["status"] == "no_ref":
+                no_ref_count += 1
+                continue
 
-        # Find reference
-        ref_path = find_reference(ref_id, args.cifs_filtered_dir, args.cifs_dir)
-
-        if not ref_path:
-            print(f"\n[{pdb_id}] No reference found for {pdb_id}")
-            no_ref_count += 1
-            continue
-
-        print(f"\n[{pdb_id}] Model: {model_path.name}")
-        print(f"       Reference: {ref_path.name}")
-
-        # Get chain mapping for filtering AB-AG interfaces
-        ab_chains, ag_chains = get_chain_type_mapping(ab_ag_mapping, pdb_id)
-
-        # Run DockQ (no --mapping flags, filter by native_chains post-hoc)
-        dockq_output = run_dockq(model_path, ref_path)
-
-        if dockq_output is None:
-            print(f"       ERROR: DockQ failed")
-            fail_count += 1
-            continue
-
-        # Parse output
-        global_result, interfaces = parse_dockq_output(dockq_output)
-        global_dockq = global_result.get("dockq_score", "N/A")
-        print(f"       Global DockQ: {global_dockq}")
-        print(f"       Interfaces found: {len(interfaces)}")
-
-        # Create results for each interface (all interfaces, not filtered)
-        if ab_chains and ag_chains:
-            ab_ag_count = sum(1 for iface in interfaces if is_ab_ag_interface(iface.get("native_chains", ""), ab_chains, ag_chains))
-            if ab_ag_count < len(interfaces):
-                print(f"       AB-AG interfaces: {ab_ag_count} (excluded {len(interfaces) - ab_ag_count} non-AB-AG)")
-
-        for idx, iface in enumerate(interfaces, 1):
-            iface_dockq = iface.get("dockq_score", "N/A")
-            quality_bin = determine_quality_bin(iface_dockq)
-
-            print(f"       Interface {idx}: {iface.get('native_chains', 'N/A')} "
-                  f"DockQ={iface_dockq} ({quality_bin})")
-
-            native_chains = iface.get("native_chains", "N/A")
-            is_ab_ag = is_ab_ag_interface(native_chains, ab_chains, ag_chains) if ab_chains and ag_chains else True
-
-            result = {
-                "pdb_id": pdb_id,
-                "model_path": model_path,
-                "reference_path": ref_path,
-                "interface_id": f"{pdb_id}_{model_path.stem}_iface{idx}",
-                "native_chains": native_chains,
-                "ab_chains": ",".join(ab_chains) if ab_chains else "N/A",
-                "ag_chains": ",".join(ag_chains) if ag_chains else "N/A",
-                "dockq_score": iface_dockq,
-                "iRMSD": iface.get("iRMSD", "N/A"),
-                "LRMSD": iface.get("LRMSD", "N/A"),
-                "fnat": iface.get("fnat", "N/A"),
-                "quality_bin": quality_bin,
-                "is_ab_ag": is_ab_ag,
-            }
-            results.append(result)
-            all_results.append(result)
-
-        if dockq_output is not None:
-            # Write results incrementally after each model
+            results = outcome["results"]
+            all_results.extend(results)
             append_results(results, args.output)
             if args.interface_report:
                 ab_ag_results = [r for r in results if r.get("is_ab_ag", False)]
                 append_results(ab_ag_results, args.interface_report)
-
-        success_count += 1
+            success_count += 1
 
     # Summary
     print(f"\n{'='*60}")
